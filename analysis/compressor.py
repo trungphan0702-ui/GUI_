@@ -18,41 +18,6 @@ def build_stepped_tone(freq: float, fs: int, amp_max: float = 1.0) -> Dict[str, 
     return {'signal': tx.astype(np.float32), 'meta': meta}
 
 
-def apply_compressor(sig: np.ndarray, threshold_db: float = -18.0, ratio: float = 3.0,
-                     makeup_db: float = 0.0, knee_db: float = 0.0) -> np.ndarray:
-    """Apply a simple static compressor curve for testing.
-
-    Args:
-        sig: Input signal (float32 array).
-        threshold_db: Threshold in dBFS where compression begins.
-        ratio: Compression ratio above threshold.
-        makeup_db: Makeup gain applied after compression.
-        knee_db: Optional soft knee width.
-    """
-
-    sig = np.asarray(sig, dtype=np.float32)
-    eps = 1e-8
-    abs_sig = np.abs(sig) + eps
-    level_db = 20 * np.log10(abs_sig)
-    over_db = level_db - threshold_db
-
-    if knee_db > 0:
-        # Soft knee interpolation
-        knee_start = -knee_db / 2
-        soft_region = over_db / max(knee_db, eps)
-        soft_region = np.clip(soft_region, 0.0, 1.0)
-        soft_gain_db = soft_region * (over_db * (1 - 1 / ratio))
-        over_db = np.where(over_db > knee_start, over_db, 0.0)
-    else:
-        soft_gain_db = 0.0
-
-    compressed_db = np.where(over_db > 0, threshold_db + over_db / ratio, level_db)
-    compressed_db += makeup_db
-    gain_db = compressed_db - level_db + soft_gain_db
-    gain_lin = 10 ** (gain_db / 20.0)
-    return (sig * gain_lin).astype(np.float32)
-
-
 def compression_curve(sig: np.ndarray, meta: Dict[str, Any], fs: int, freq: float) -> Dict[str, Any]:
     segN = meta['seg_samples']
     gapN = meta['gap_samples']

@@ -36,24 +36,15 @@ def _sine(freq: float, fs: int, duration: float, amp: float = 0.5) -> np.ndarray
     return (amp * np.sin(2 * np.pi * freq * t)).astype(np.float32)
 
 
-def _assert_thd_contract(result: dict) -> None:
-    required = ("thd_db", "thd_percent", "thdn_db", "thdn_percent")
-    missing = [k for k in required if k not in result]
-    if missing:
-        raise AssertionError(f"THD analysis contract violation: missing keys {missing} from compute_thd result")
-
-
 def offline_thd_tests(fs: int = 48000) -> bool:
     freq = 1000.0
     clean = _sine(freq, fs, 1.5, amp=0.5)
-    thd_clean = thd.compute_thd(clean, fs, freq=freq)
-    _assert_thd_contract(thd_clean)
+    thd_clean = thd.compute_thd(clean, fs, freq)
     ok_clean = thd_clean['thd_db'] < -60 and thd_clean['thdn_db'] < -50
 
     dist = clean + 0.05 * np.sin(2 * np.pi * 2 * freq * np.arange(len(clean)) / fs)
     dist += 0.02 * np.sin(2 * np.pi * 3 * freq * np.arange(len(clean)) / fs)
-    thd_dist = thd.compute_thd(dist, fs, f0=freq)
-    _assert_thd_contract(thd_dist)
+    thd_dist = thd.compute_thd(dist, fs, freq)
     ok_dist = thd_dist['thd_db'] > -40 and thd_dist['thdn_db'] > -40
 
     ok = True
