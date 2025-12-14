@@ -1,13 +1,20 @@
 import os
+import threading
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
-import threading
+
+import numpy as np
 
 # Try to import sounddevice for device listing
 try:
     import sounddevice as sd
 except Exception:
     sd = None
+
+from analysis import attack_release, compare, compressor, thd
+from audio import devices, playrec, wav_io
+from utils.logging import UILogger
+from utils.threading import run_in_thread
 
 # ============================================================
 # CONSTANTS
@@ -60,6 +67,13 @@ class AudioAnalysisToolkitApp:
         self.hw_ar_rms_win = tk.StringVar(value='5')
         self.hw_thd_hmax = tk.StringVar(value='5')
         self.thd_max_h = tk.StringVar(value='5')
+        self.offline_in = tk.StringVar(value='')
+        self.offline_out = tk.StringVar(value='')
+
+        self.state = {'input_file': '', 'received_file': ''}
+        self.stop_event = threading.Event()
+        self.worker = None
+        self.logger = UILogger(self.hw_log)
 
         self._configure_style()
         self._build_ui()
@@ -88,6 +102,34 @@ class AudioAnalysisToolkitApp:
         self.log_text.see(tk.END)
 
     # ---------------------------------------------------------
+    def _start_thread(self, target, name=None):
+        if self.worker and self.worker.is_alive():
+            self.hw_log("Một tác vụ khác đang chạy. Vui lòng chờ...")
+            return
+        self.worker = run_in_thread(target, self.stop_event, name=name)
+
+    def request_stop(self):
+        self.stop_event.set()
+
+    def _require_sounddevice(self):
+        if sd is None:
+            messagebox.showerror("Sounddevice", "Sounddevice không khả dụng. Cài đặt thư viện trước khi đo HW.")
+            return False
+        return True
+
+    def _parse_float(self, var, default=0.0):
+        try:
+            return float(var.get())
+        except Exception:
+            return default
+
+    def _parse_int(self, var, default=1):
+        try:
+            return int(var.get())
+        except Exception:
+            return default
+
+    # ---------------------------------------------------------
     # DEVICE REFRESH
     # ---------------------------------------------------------
     def _refresh_hw_devices(self):
@@ -95,15 +137,7 @@ class AudioAnalysisToolkitApp:
             self.hw_log("Sounddevice không khả dụng.")
             return
         try:
-            devs = sd.query_devices()
-            inputs, outputs = [], []
-            for i, d in enumerate(devs):
-                name = f"{i}: {d['name']}"
-                if d.get('max_input_channels', 0) > 0:
-                    inputs.append(name)
-                if d.get('max_output_channels', 0) > 0:
-                    outputs.append(name)
-
+            inputs, outputs = devices.list_devices()
             self.cb_in['values'] = inputs
             self.cb_out['values'] = outputs
 
@@ -123,7 +157,20 @@ class AudioAnalysisToolkitApp:
         p = filedialog.askopenfilename(filetypes=[("WAV files", "*.wav"), ("All files", "*.*")])
         if p:
             self.hw_loop_file.set(p)
+            self.state['input_file'] = p
             self.hw_log(f"Đã chọn file: {p}")
+
+    def select_offline_in(self):
+        p = filedialog.askopenfilename(filetypes=[("WAV files", "*.wav")])
+        if p:
+            self.offline_in.set(p)
+            self.hw_log(f"File Input: {p}")
+
+    def select_offline_out(self):
+        p = filedialog.askopenfilename(filetypes=[("WAV files", "*.wav")])
+        if p:
+            self.offline_out.set(p)
+            self.hw_log(f"File Output: {p}")
 
     # ---------------------------------------------------------
     # BUILD UI
@@ -177,7 +224,7 @@ class AudioAnalysisToolkitApp:
 
         ttk.Button(grp_a, text="▶ CHẠY TEST COMPRESSOR (HW)",
                    style="Accent.TButton",
-                   command=lambda: self.hw_log("Test Compressor (chưa cài)")
+                   command=lambda: self._start_thread(self.run_hw_compressor, name="compressor_hw")
                    ).pack(fill="x", padx=6, pady=8)
 
         # -------------------------------------------------
@@ -193,7 +240,7 @@ class AudioAnalysisToolkitApp:
         ttk.Entry(fb, textvariable=self.thd_max_h, width=4).pack(side="left")
 
         ttk.Button(grp_b, text="▶ CHẠY TEST THD (HW)",
-                   command=lambda: self.hw_log("Test THD (chưa cài)")
+                   command=lambda: self._start_thread(self.run_hw_thd, name="thd_hw")
                    ).pack(fill="x", padx=6, pady=8)
 
         # -------------------------------------------------
@@ -202,7 +249,7 @@ class AudioAnalysisToolkitApp:
         grp_c.pack(fill="x", padx=6, pady=8)
 
         ttk.Button(grp_c, text="▶ CHẠY TEST A/R (HW)",
-                   command=lambda: self.hw_log("Test AR (chưa cài)")
+                   command=lambda: self._start_thread(self.run_hw_attack_release, name="ar_hw")
                    ).pack(fill="x", padx=6, pady=8)
 
         far = ttk.Frame(grp_c)
@@ -224,7 +271,7 @@ class AudioAnalysisToolkitApp:
 
         ttk.Button(grp_d, text="1. ▶ CHẠY LOOPBACK & SAVE (All Files)",
                    style="Accent.TButton",
-                   command=lambda: self.hw_log("Loopback placeholder")
+                   command=lambda: self._start_thread(self.run_loopback_record, name="loopback")
                    ).pack(fill="x", padx=6, pady=8)
 
         # Sub-analysis
@@ -232,12 +279,12 @@ class AudioAnalysisToolkitApp:
         ana.pack(fill="x", padx=6, pady=4)
 
         ttk.Button(ana, text="A. Phân tích Compressor",
-                   command=lambda: self.hw_log("Phân tích A")).pack(fill="x", padx=6, pady=4)
+                   command=lambda: self._start_thread(lambda: self.analyze_loopback('compressor'), name="ana_comp")).pack(fill="x", padx=6, pady=4)
 
         f_thd = ttk.Frame(ana)
         f_thd.pack(fill="x", padx=6, pady=4)
         ttk.Button(f_thd, text="B. Phân tích THD",
-                   command=lambda: self.hw_log("Phân tích THD")
+                   command=lambda: self._start_thread(lambda: self.analyze_loopback('thd'), name="ana_thd")
                    ).pack(side="left", expand=True, fill="x")
         ttk.Label(f_thd, text="Max H:").pack(side="left", padx=6)
         ttk.Entry(f_thd, textvariable=self.hw_thd_hmax, width=4).pack(side="left")
@@ -245,7 +292,7 @@ class AudioAnalysisToolkitApp:
         f_ar2 = ttk.Frame(ana)
         f_ar2.pack(fill="x", padx=6, pady=4)
         ttk.Button(f_ar2, text="C. Phân tích A/R",
-                   command=lambda: self.hw_log("Phân tích AR")).pack(side="left", expand=True, fill="x")
+                   command=lambda: self._start_thread(lambda: self.analyze_loopback('ar'), name="ana_ar")).pack(side="left", expand=True, fill="x")
         ttk.Label(f_ar2, text="RMS Win (ms):").pack(side="left", padx=6)
         ttk.Entry(f_ar2, textvariable=self.hw_ar_rms_win, width=4).pack(side="left")
 
@@ -258,19 +305,19 @@ class AudioAnalysisToolkitApp:
         fe.pack(fill="x", padx=6, pady=6)
 
         ttk.Label(fe, text="File Input:").grid(row=0, column=0)
-        ttk.Entry(fe, width=30).grid(row=0, column=1, sticky="we", padx=6)
-        ttk.Button(fe, text="Browse...").grid(row=0, column=2, padx=6)
+        ttk.Entry(fe, width=30, textvariable=self.offline_in).grid(row=0, column=1, sticky="we", padx=6)
+        ttk.Button(fe, text="Browse...", command=self.select_offline_in).grid(row=0, column=2, padx=6)
 
         ttk.Label(fe, text="File Output:").grid(row=1, column=0)
-        ttk.Entry(fe, width=30).grid(row=1, column=1, sticky="we", padx=6)
-        ttk.Button(fe, text="Browse...").grid(row=1, column=2, padx=6)
+        ttk.Entry(fe, width=30, textvariable=self.offline_out).grid(row=1, column=1, sticky="we", padx=6)
+        ttk.Button(fe, text="Browse...", command=self.select_offline_out).grid(row=1, column=2, padx=6)
         fe.grid_columnconfigure(1, weight=1)
 
         small_ana = ttk.Frame(grp_e)
         small_ana.pack(fill="x", padx=6, pady=4)
-        ttk.Button(small_ana, text="A. Phân tích Compressor").pack(fill="x", pady=2)
-        ttk.Button(small_ana, text="B. Phân tích THD").pack(fill="x", pady=2)
-        ttk.Button(small_ana, text="C. Phân tích A/R").pack(fill="x", pady=2)
+        ttk.Button(small_ana, text="A. Phân tích Compressor", command=lambda: self._start_thread(lambda: self.analyze_offline('compressor'), name="off_comp")).pack(fill="x", pady=2)
+        ttk.Button(small_ana, text="B. Phân tích THD", command=lambda: self._start_thread(lambda: self.analyze_offline('thd'), name="off_thd")).pack(fill="x", pady=2)
+        ttk.Button(small_ana, text="C. Phân tích A/R", command=lambda: self._start_thread(lambda: self.analyze_offline('ar'), name="off_ar")).pack(fill="x", pady=2)
 
         # -------------------------------------------------
         # RIGHT PANEL: LOGS
@@ -291,6 +338,201 @@ class AudioAnalysisToolkitApp:
 
         # Startup log
         self.hw_log("[Khởi động] Làm mới danh sách thiết bị âm thanh.")
+
+    # ---------------------------------------------------------
+    # HARDWARE TASKS
+    # ---------------------------------------------------------
+    def _device_indices(self):
+        return devices.parse_device(self.hw_input_dev.get()), devices.parse_device(self.hw_output_dev.get())
+
+    def _prepare_signal(self, sig: np.ndarray) -> np.ndarray:
+        sig = sig.astype(np.float32)
+        fade = min(256, len(sig) // 10)
+        if fade > 0:
+            window = np.linspace(0, 1, fade)
+            sig[:fade] *= window
+            sig[-fade:] *= window[::-1]
+        return sig
+
+    def run_hw_thd(self):
+        if not self._require_sounddevice():
+            return
+        freq = self._parse_float(self.hw_freq, 1000.0)
+        amp = self._parse_float(self.hw_amp, 0.7)
+        hmax = self._parse_int(self.thd_max_h, 5)
+        in_dev, out_dev = self._device_indices()
+        fs = devices.default_samplerate(out_dev or None)
+        duration = 2.0
+        t = np.linspace(0, duration, int(fs * duration), endpoint=False)
+        tone = self._prepare_signal(amp * np.sin(2 * np.pi * freq * t))
+        self.logger.banner(f"THD HW @ {freq} Hz, amp {amp}")
+        recorded = playrec.play_and_record(tone, fs, in_dev, out_dev, self.stop_event, log=self.hw_log)
+        if recorded is None:
+            self.hw_log("Không ghi được dữ liệu.")
+            return
+        res = thd.compute_thd(recorded, fs, f0=freq, max_h=hmax)
+        self.hw_log(f"THD ≈ {res['thd_percent']:.4f}% ({res['thd_db']:.2f} dB)")
+        for h, v in res['harmonics_dbc'].items():
+            self.hw_log(f"H{h}: {v:.2f} dBc")
+
+    def run_hw_compressor(self):
+        if not self._require_sounddevice():
+            return
+        freq = self._parse_float(self.hw_freq, 1000.0)
+        amp_max = self._parse_float(self.hw_amp, 1.0)
+        in_dev, out_dev = self._device_indices()
+        fs = devices.default_samplerate(out_dev or None)
+        tx_meta = compressor.build_stepped_tone(freq, fs, amp_max)
+        tone = self._prepare_signal(tx_meta['signal'])
+        self.logger.banner("Đo compressor (stepped sweep)")
+        recorded = playrec.play_and_record(tone, fs, in_dev, out_dev, self.stop_event, log=self.hw_log)
+        if recorded is None:
+            self.hw_log("Không ghi được dữ liệu compressor.")
+            return
+        curve = compressor.compression_curve(recorded, tx_meta['meta'], fs, freq)
+        if curve['no_compression']:
+            self.hw_log(f"Path gain ≈ {curve['gain_offset_db']:+.2f} dB (không thấy nén)")
+        else:
+            self.hw_log(f"Threshold ≈ {curve['thr_db']:.2f} dBFS | Ratio ≈ {curve['ratio']:.2f}:1 | Gain offset {curve['gain_offset_db']:+.2f} dB")
+
+    def run_hw_attack_release(self):
+        if not self._require_sounddevice():
+            return
+        freq = self._parse_float(self.hw_freq, 1000.0)
+        amp = self._parse_float(self.hw_amp, 0.7)
+        rms_win = self._parse_float(self.hw_ar_rms_win, 5)
+        in_dev, out_dev = self._device_indices()
+        fs = devices.default_samplerate(out_dev or None)
+        tone = self._prepare_signal(attack_release.generate_step_tone(freq, fs, amp=amp))
+        self.logger.banner("Đo Attack/Release")
+        recorded = playrec.play_and_record(tone, fs, in_dev, out_dev, self.stop_event, log=self.hw_log)
+        if recorded is None:
+            self.hw_log("Không ghi được dữ liệu A/R.")
+            return
+        times = attack_release.attack_release_times(recorded, fs, rms_win)
+        self.hw_log(f"Attack ≈ {times['attack_ms']:.1f} ms | Release ≈ {times['release_ms']:.1f} ms")
+
+    # ---------------------------------------------------------
+    # LOOPBACK & FILE OPERATIONS
+    # ---------------------------------------------------------
+    def run_loopback_record(self):
+        if not self._require_sounddevice():
+            return
+        in_dev, out_dev = self._device_indices()
+        src = self.hw_loop_file.get()
+        if not src or not os.path.isfile(src):
+            messagebox.showwarning("Chọn file", "Chọn file WAV input.")
+            return
+        fs, data = wav_io.read_wav(src)
+        if fs is None:
+            self.hw_log("Không đọc được file input.")
+            return
+        self.state['input_file'] = src
+        data = self._prepare_signal(np.asarray(data, dtype=np.float32))
+        self.logger.banner("Loopback & ghi received.wav")
+        recorded = playrec.play_and_record(data, fs, in_dev, out_dev, self.stop_event, log=self.hw_log)
+        if recorded is None:
+            self.hw_log("Loopback thất bại.")
+            return
+        save_path = os.path.join(BASE_DIR, "received.wav")
+        if wav_io.write_wav(save_path, recorded, fs):
+            self.state['received_file'] = save_path
+            self.hw_log(f"Đã lưu file thu: {save_path}")
+        else:
+            self.hw_log("Không thể lưu received.wav")
+
+    # ---------------------------------------------------------
+    # ANALYSIS HELPERS
+    # ---------------------------------------------------------
+    def _analyze_single_file(self, mode: str, path: str):
+        fs, data = wav_io.read_wav(path)
+        if fs is None:
+            self.hw_log("Không đọc được file.")
+            return
+        freq = self._parse_float(self.hw_freq, 1000.0)
+        hmax = self._parse_int(self.hw_thd_hmax, 5)
+        rms_win = self._parse_float(self.hw_ar_rms_win, 5)
+        if mode == 'thd':
+            res = thd.compute_thd(data, fs, f0=freq, max_h=hmax)
+            self.hw_log(f"[Single] THD {os.path.basename(path)}: {res['thd_percent']:.4f}% ({res['thd_db']:.2f} dB)")
+        elif mode == 'compressor':
+            meta = compressor.build_stepped_tone(freq, fs)
+            res = compressor.compression_curve(data, meta['meta'], fs, freq)
+            if res['no_compression']:
+                self.hw_log("[Single] Không phát hiện nén.")
+            else:
+                self.hw_log(f"[Single] Thr {res['thr_db']:.2f} dBFS | Ratio {res['ratio']:.2f}:1 | Gain {res['gain_offset_db']:+.2f} dB")
+        elif mode == 'ar':
+            times = attack_release.attack_release_times(data, fs, rms_win)
+            self.hw_log(f"[Single] Attack {times['attack_ms']:.1f} ms | Release {times['release_ms']:.1f} ms")
+
+    def _log_residual_metrics(self, metrics, latency_ms, gain_error_db):
+        self.hw_log(f"Latency: {latency_ms:.2f} ms | Gain error: {gain_error_db:+.2f} dB")
+        self.hw_log(f"Noise floor: {metrics['noise_floor_dbfs']:.2f} dBFS | Residual RMS: {metrics['residual_rms_dbfs']:.2f} dBFS")
+        self.hw_log(f"SNR (est): {metrics['snr_db']:.2f} dB | THD delta: {metrics['thd_delta_db']:+.2f} dB")
+        self.hw_log(f"FR deviation (median): {metrics['fr_dev_median_db']:+.2f} dB")
+        hums = ", ".join([f"{h['freq']}Hz:{h['level_db']:.1f}dB" for h in metrics['hum_peaks']])
+        self.hw_log(f"Hum peaks: {hums}")
+
+    def _analyze_pair(self, mode: str, input_path: str, recv_path: str):
+        freq = self._parse_float(self.hw_freq, 1000.0)
+        hmax = self._parse_int(self.hw_thd_hmax, 5)
+        rms_win = self._parse_float(self.hw_ar_rms_win, 5)
+        fs_in, sig_in = wav_io.read_wav(input_path)
+        fs_out, sig_out = wav_io.read_wav(recv_path)
+        if fs_in is None or fs_out is None:
+            self.hw_log("Không đọc được file input/output.")
+            return
+        if fs_in != fs_out:
+            self.hw_log("Fs không khớp giữa hai file.")
+            return
+        sig_in = np.asarray(sig_in, dtype=np.float32)
+        sig_out = np.asarray(sig_out, dtype=np.float32)
+        a_in, a_out, lag = compare.align_signals(sig_in, sig_out)
+        a_out, gain_err = compare.gain_match(a_in, a_out)
+        latency_ms = lag / fs_in * 1000.0
+        metrics = compare.residual_metrics(a_in, a_out, fs_in, freq, hmax)
+        self._log_residual_metrics(metrics, latency_ms, gain_err)
+        if mode == 'thd':
+            self.hw_log(f"THD input: {metrics['thd_ref_db']:.2f} dB | received: {metrics['thd_tgt_db']:.2f} dB")
+        elif mode == 'compressor':
+            meta = compressor.build_stepped_tone(freq, fs_in)
+            base_curve = compressor.compression_curve(a_in, meta['meta'], fs_in, freq)
+            out_curve = compressor.compression_curve(a_out, meta['meta'], fs_in, freq)
+            self.hw_log(f"Input Thr {base_curve['thr_db']:.2f} | Ratio {base_curve['ratio']:.2f}")
+            self.hw_log(f"Received Thr {out_curve['thr_db']:.2f} | Ratio {out_curve['ratio']:.2f}")
+            self.hw_log(f"ΔThr {out_curve['thr_db'] - base_curve['thr_db']:+.2f} dB | ΔRatio {out_curve['ratio'] - base_curve['ratio']:+.2f}")
+        elif mode == 'ar':
+            cmp_ar = attack_release.compare_attack_release(a_in, a_out, fs_in, rms_win)
+            self.hw_log(f"Attack in/out: {cmp_ar['input']['attack_ms']:.1f} / {cmp_ar['output']['attack_ms']:.1f} ms | Δ {cmp_ar['delta_attack']:+.1f} ms")
+            self.hw_log(f"Release in/out: {cmp_ar['input']['release_ms']:.1f} / {cmp_ar['output']['release_ms']:.1f} ms | Δ {cmp_ar['delta_release']:+.1f} ms")
+
+    def analyze_loopback(self, mode: str):
+        inp = self.state.get('input_file') or self.hw_loop_file.get()
+        rec = self.state.get('received_file')
+        if inp and rec and os.path.isfile(inp) and os.path.isfile(rec):
+            self.logger.banner("COMPARE MODE (Loopback)")
+            self._analyze_pair(mode, inp, rec)
+        elif inp and os.path.isfile(inp):
+            self.logger.banner("SINGLE FILE MODE (Loopback)")
+            self._analyze_single_file(mode, inp)
+        else:
+            self.hw_log("Chưa có file loopback để phân tích.")
+
+    def analyze_offline(self, mode: str):
+        inp = self.offline_in.get()
+        out = self.offline_out.get()
+        if inp and out and os.path.isfile(inp) and os.path.isfile(out):
+            self.logger.banner("COMPARE MODE (Offline)")
+            self._analyze_pair(mode, inp, out)
+        elif inp and os.path.isfile(inp):
+            self.logger.banner("SINGLE FILE MODE (Offline)")
+            self._analyze_single_file(mode, inp)
+        elif out and os.path.isfile(out):
+            self.logger.banner("SINGLE FILE MODE (Offline out)")
+            self._analyze_single_file(mode, out)
+        else:
+            self.hw_log("Chọn ít nhất một file để phân tích.")
 
     # ---------------------------------------------------------
     def _now_str(self):
