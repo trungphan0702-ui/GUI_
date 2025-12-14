@@ -40,15 +40,11 @@ def offline_thd_tests(fs: int = 48000) -> bool:
     freq = 1000.0
     clean = _sine(freq, fs, 1.5, amp=0.5)
     thd_clean = thd.compute_thd(clean, fs, freq)
-    if 'thdn_db' not in thd_clean:
-        raise AssertionError("THD analysis contract violation: 'thdn_db' missing from compute_thd result")
     ok_clean = thd_clean['thd_db'] < -60 and thd_clean['thdn_db'] < -50
 
     dist = clean + 0.05 * np.sin(2 * np.pi * 2 * freq * np.arange(len(clean)) / fs)
     dist += 0.02 * np.sin(2 * np.pi * 3 * freq * np.arange(len(clean)) / fs)
     thd_dist = thd.compute_thd(dist, fs, freq)
-    if 'thdn_db' not in thd_dist:
-        raise AssertionError("THD analysis contract violation: 'thdn_db' missing from compute_thd result")
     ok_dist = thd_dist['thd_db'] > -40 and thd_dist['thdn_db'] > -40
 
     ok = True
