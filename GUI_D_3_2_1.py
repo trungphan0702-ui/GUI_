@@ -370,7 +370,7 @@ class AudioAnalysisToolkitApp:
         if recorded is None:
             self.hw_log("Không ghi được dữ liệu.")
             return
-        res = thd.compute_thd(recorded, fs, f0=freq, max_h=hmax)
+        res = thd.compute_thd(recorded, fs, freq, hmax)
         self.hw_log(f"THD ≈ {res['thd_percent']:.4f}% ({res['thd_db']:.2f} dB)")
         for h, v in res['harmonics_dbc'].items():
             self.hw_log(f"H{h}: {v:.2f} dBc")
@@ -453,7 +453,7 @@ class AudioAnalysisToolkitApp:
         hmax = self._parse_int(self.hw_thd_hmax, 5)
         rms_win = self._parse_float(self.hw_ar_rms_win, 5)
         if mode == 'thd':
-            res = thd.compute_thd(data, fs, f0=freq, max_h=hmax)
+            res = thd.compute_thd(data, fs, freq, hmax)
             self.hw_log(f"[Single] THD {os.path.basename(path)}: {res['thd_percent']:.4f}% ({res['thd_db']:.2f} dB)")
         elif mode == 'compressor':
             meta = compressor.build_stepped_tone(freq, fs)
